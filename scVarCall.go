@@ -15,8 +15,6 @@ import (
 	"os/exec"
 	"reflect"
 	"strings"
-	"bufio"
-	"compress/gzip"
 	"sync"
 	"time"
 
@@ -375,7 +373,7 @@ func main() {
 		writeCheckpoint(barcode_list, current_step)
 	}
 
-	current_step = 4
+	current_step = 5
 	if fileExists(output_dir + fmt.Sprintf("checkpoint_%d.json", current_step)) {
 		jsonFile, err := os.Open(output_dir + fmt.Sprintf("checkpoint_%d.json", current_step))
 		byteValue, _ := ioutil.ReadAll(jsonFile)
@@ -397,7 +395,7 @@ func main() {
 		writeCheckpoint(barcode_list, current_step)
 	}
 
-	current_step = 5
+	current_step = 6
 	if fileExists(output_dir + fmt.Sprintf("checkpoint_%d.json", current_step)) {
 		jsonFile, err := os.Open(output_dir + fmt.Sprintf("checkpoint_%d.json", current_step))
 		byteValue, _ := ioutil.ReadAll(jsonFile)
@@ -419,7 +417,7 @@ func main() {
 			samtools_exec, "view", (&barcode_list[0]).Masterbam_UMI_deduped,
 			"|", "grep", "-oE", "CB:Z:[acgtnACGTN-]+[1-9]",
 			"|", "sort", "-u", "--parallel", threads,
-			"|", "gzip", ">", output_dir + "unique_barcodes.tsv.gz").CombinedOutput()
+			">", output_dir + "unique_barcodes.tsv").CombinedOutput()
 
 		if err != nil {
 			// Display everything we got if error.
@@ -434,44 +432,44 @@ func main() {
 
 
 
-	current_step = 6
-	if fileExists(output_dir + fmt.Sprintf("checkpoint_%d.json", current_step)) {
-		jsonFile, err := os.Open(output_dir + fmt.Sprintf("checkpoint_%d.json", current_step))
-		byteValue, _ := ioutil.ReadAll(jsonFile)
-		err = json.Unmarshal([]byte(byteValue), &barcode_list)
-		if err != nil {
-			panic(err)
-		}
+	//current_step = 6
+	//if fileExists(output_dir + fmt.Sprintf("checkpoint_%d.json", current_step)) {
+		//jsonFile, err := os.Open(output_dir + fmt.Sprintf("checkpoint_%d.json", current_step))
+		//byteValue, _ := ioutil.ReadAll(jsonFile)
+		//err = json.Unmarshal([]byte(byteValue), &barcode_list)
+		//if err != nil {
+			//panic(err)
+		//}
 
-		log.Println(fmt.Sprintf("Checkpoint exists for step %d, loading progress", current_step))
+		//log.Println(fmt.Sprintf("Checkpoint exists for step %d, loading progress", current_step))
 
-	} else {
-		log.Println(fmt.Sprintf("Starting step %d", current_step))
+	//} else {
+		//log.Println(fmt.Sprintf("Starting step %d", current_step))
 
-		log.Println("Parsing unique barcodes file into memory")
+		//log.Println("Parsing unique barcodes file into memory")
 
-		barcodefile, err := os.Open(output_dir + "unique_barcodes.tsv.gz")
-		if err != nil {
-			log.Fatal(err)
-		}
-		defer barcodefile.Close()
+		//barcodefile, err := os.Open(output_dir + "unique_barcodes.tsv.gz")
+		//if err != nil {
+			//log.Fatal(err)
+		//}
+		//defer barcodefile.Close()
 
-		gr, err := gzip.NewReader(barcodefile)
-		if err != nil {
-			log.Fatal(err)
-		}
-		defer gr.Close()
+		//gr, err := gzip.NewReader(barcodefile)
+		//if err != nil {
+			//log.Fatal(err)
+		//}
+		//defer gr.Close()
 
-		barcodefile_scanner := bufio.NewScanner(gr)
-		for barcodefile_scanner.Scan() {
-			// remove CB:Z: prefix to get just the cell barcode
-			barcode_str := strings.Trim(barcodefile_scanner.Text(), "CB:Z:")
-			new_barcode := barcode{Name: barcode_str}
-			barcode_list = append(barcode_list, new_barcode)
-		}
+		//barcodefile_scanner := bufio.NewScanner(gr)
+		//for barcodefile_scanner.Scan() {
+			//// remove CB:Z: prefix to get just the cell barcode
+			//barcode_str := strings.Trim(barcodefile_scanner.Text(), "CB:Z:")
+			//new_barcode := barcode{Name: barcode_str}
+			//barcode_list = append(barcode_list, new_barcode)
+		//}
 
-		writeCheckpoint(barcode_list, current_step)
-	}
+		//writeCheckpoint(barcode_list, current_step)
+	//}
 
 
 
@@ -488,59 +486,35 @@ func main() {
 
 	} else {
 
-	cellsplit_map := make(map[string]string)
+		barcode_file := output_dir + "unique_barcodes.tsv"
 
-		for i := range barcode_list {
-			cell := &barcode_list[i]
-			if (len(cellsplit_map) < 10) {
-				if (cell.Name != "MASTER") {
-					job_out := output_dir + "cellsplit_" + cell.Name + ".o"
-					job_err := output_dir + "cellsplit_" + cell.Name + ".e"
-					job_bam := output_dir + "cell_" + cell.Name + ".bam"
-
-					cellsplit_map[cell.Name] = job_out
-
-
-					job_barcode_filename := output_dir+ "barcode_" + cell.Name + ".txt"
-					job_barcode_out, err := os.Create(job_barcode_filename)
-					if err != nil {
-						log.Fatal(err)
-					}
-					defer job_barcode_out.Close()
-
-					_, err = job_barcode_out.WriteString(cell.Name+"\n")
-
-					cell.Splitbam_jobout = job_out
-					cell.Splitbam_joberr = job_err
-					cell.Splitbam_barcodefile = job_bam
-					cell.Splitbam_bamout = job_bam
-
-					output, err := exec.Command(
-						"bsub",
-						"-o", job_out,
-						"-e", job_err,
-						"-R'select[mem>5000] rusage[mem=5000]'", "-M5000",
-						"-n", "12",
-						"subset-bam", "--cores", "12",
-						"--bam", (&barcode_list[0]).Masterbam_UMI_deduped,
-						"--cell-barcodes", job_barcode_filename,
-						"--out-bam", job_bam).CombinedOutput()
-
-					if err != nil {
-						// Display everything we got if error.
-						log.Println("Error when running command.  Output:")
-						log.Println(string(output))
-						log.Printf("Got command status: %s\n", err.Error())
-						return
-					}
-
-
-				}
-			} else {
-
-				bjobsIsCompleted(cellsplit_map, "Splitbam_successful", &barcode_list)
-			}
+		err := os.Mkdir(output_dir + "/split_output/", 0755)
+		if err != nil {
+			log.Fatal(err)
 		}
+
+		output, err := exec.Command(
+			"echo",
+			"bsub",
+			"-R'span[hosts=1]'",
+			"-o", output_dir + "/split_output/%J/" + "splitbam.%I.out",
+			"-e", output_dir + "/split_output/%J/" + "splitbam.%I.err",
+			"-R'select[mem>=5000] rusage[mem=5000]'", "-M5000",
+			"-n", "12",
+			"-J'splitbam[1-20]%10'",
+			"bash","subsetbam_inner_script.sh", (&barcode_list[0]).Masterbam_UMI_deduped, barcode_file, output_dir + "/split_output/%J/").CombinedOutput()
+			log.Println(string(output))
+
+
+			//"-J\"splitbam[1-`wc -l<"+barcode_file+"`]%10\"",
+		if err != nil {
+			// Display everything we got if error.
+			log.Println("Error when running command.  Output:")
+			log.Println(string(output))
+			log.Printf("Got command status: %s\n", err.Error())
+			return
+		}
+
 
 		//writeCheckpoint(barcode_list, current_step)
 	}
