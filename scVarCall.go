@@ -1,11 +1,8 @@
 package main
 
-// Only MT will be kept from bam with
-// samtools view $bam chrMT -b > $mt_bam
-// UMIs will be remove with
-// umi_tools dedup --extract-umi-method=tag --umi-tag=UB -I $mt_bam $dedup_bam
-
 import (
+	"bufio"
+	"compress/gzip"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -14,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -34,14 +32,22 @@ import (
 // 0. Index bam file
 // 0. Call all variants (not just second-max)
 
-// 0. Download CRAM files
-// 0. Download imeta files for each cram file
-// 0. Establish unique sample names exist
-// 0. Convert the CRAM files to fastq
-// 0. Symlink the fastqs to two different folders depending on 'Library_type'
-// 0. Align extracted fastqs with STAR or BWA depending on 'Library_type'
-// 0. Index realigned bam files
-// 0. Generate counts matrix of RNA bams
+func chunkSlice(slice []barcode, chunkSize int) [][]barcode {
+	var chunks [][]barcode
+	for i := 0; i < len(slice); i += chunkSize {
+		end := i + chunkSize
+
+		// necessary check to avoid slicing beyond
+		// slice capacity
+		if end > len(slice) {
+			end = len(slice)
+		}
+
+		chunks = append(chunks, slice[i:end])
+	}
+
+	return chunks
+}
 
 // fileExists checks if a file exists and is not a directory before we
 // try using it to prevent further errors.
@@ -72,7 +78,12 @@ func writeCheckpoint(barcode_list []barcode, step int) {
 	log.Println(fmt.Sprintf("Checkpoint saved for step %d", step))
 }
 
-func bjobsIsCompleted(submitted_jobs_map map[string]string, attribute_name string, barcode_list *[]barcode) {
+func bjobsIsCompleted(
+	submitted_jobs_map map[string]string,
+	attribute_name string,
+	barcode_list *[]barcode,
+	remove_list []string,
+) {
 	// while there are still jobs in submitted_jobs_map, iterate over reading through all job outputs and only leave when all have completed successfully
 	for len(submitted_jobs_map) > 0 {
 		for i := range *barcode_list {
@@ -89,9 +100,15 @@ func bjobsIsCompleted(submitted_jobs_map map[string]string, attribute_name strin
 					if strings.Contains(string(dat), "Successfully completed.") {
 						reflect.ValueOf(func_cram).Elem().FieldByName(attribute_name).SetBool(true)
 
-						os.Remove(func_cram.Splitbam_jobout)
-						os.Remove(func_cram.Splitbam_joberr)
-						os.Remove(func_cram.Splitbam_barcodefile)
+						if len(remove_list) > 0 {
+							for _, file := range remove_list {
+								filename_path := reflect.ValueOf(func_cram).Elem().FieldByName(file).Interface().(string)
+								err := os.Remove(filename_path)
+								if err != nil {
+									log.Fatal(err)
+								}
+							}
+						}
 
 					} else {
 						log.Println(fmt.Sprintf("Error with bsub job: %s", bjobs_output_filename))
@@ -100,7 +117,6 @@ func bjobsIsCompleted(submitted_jobs_map map[string]string, attribute_name strin
 			}
 		}
 		// sleep for 5 seconds after going through every job's output before retrying
-fmt.Println(len(submitted_jobs_map))
 		time.Sleep(5 * time.Second)
 	}
 }
@@ -135,28 +151,41 @@ func indexBam(bam_filename string) {
 }
 
 type barcode struct {
-	Name string
-	Output_dir string
-	Masterbam_original string
-	Masterbam_original_quickcheck_success bool
-	Masterbam_MT_subset string
-	Masterbam_MT_subset_quickcheck_success bool
-	Masterbam_MT_subset_index_success bool
-	Masterbam_UMI_deduped string
-	Masterbam_UMI_deduped_success string
+	Name                                     string
+	Output_dir                               string
+	Masterbam_original                       string
+	Masterbam_original_quickcheck_success    bool
+	Masterbam_MT_subset                      string
+	Masterbam_MT_subset_quickcheck_success   bool
+	Masterbam_MT_subset_index_success        bool
+	Masterbam_UMI_deduped                    string
+	Masterbam_UMI_deduped_success            string
 	Masterbam_UMI_deduped_quickcheck_success bool
-	Masterbam_UMI_deduped_index_success bool
-	Splitbam_jobout string
-	Splitbam_joberr string
-	Splitbam_bamout string
-	Splitbam_barcodefile string
-	Splitbam_successful bool
+	Masterbam_UMI_deduped_index_success      bool
+	Splitbam_jobout                          string
+	Splitbam_joberr                          string
+	Splitbam_bamout                          string
+	Splitbam_bamindex                        string
+	Splitbam_barcodefile                     string
+	Splitbam_successful                      bool
+	Splitbam_indexed                         bool
+	Rvarcall_jobout                          string
+	Rvarcall_joberr                          string
+	Rvarcall_out                             string
+	Rvarcall_command_successful              bool
+	Rdsmerge_out                             string
+	Rdsmerge_err                             string
+	Rdsmerge_rds_calls                       string
+	Rdsmerge_rds_coverage                    string
+	Rdsmerge_success                         bool
 }
 
 var barcode_list []barcode
+var chunk_cell_map map[string]string
 
 var output_dir string
 var samtools_exec string
+var Rscript_exec string
 
 var wg sync.WaitGroup
 
@@ -168,10 +197,20 @@ func main() {
 	viper.AddConfigPath("$HOME/.config/") // if not found then look in .config folder
 
 	viper.SetDefault("samtools_exec", "/software/sciops/pkgg/samtools/1.10.0/bin/samtools")
+	viper.SetDefault("Rscript_exec", "/software/R-4.1.0/bin/Rscript")
 	viper.SetDefault("umitools_exec", "/software/teamtrynka/conda/trynka-base/bin/umi_tools")
-	viper.SetDefault("star_exec", "/nfs/users/nfs_r/rr11/Tools/STAR-2.5.2a/bin/Linux_x86_64_static/STAR")
-	viper.SetDefault("star_genome_dir", "/lustre/scratch119/casm/team78pipelines/reference/human/GRCh37d5_ERCC92/star/75/")
-	viper.SetDefault("genome_annot", "/lustre/scratch119/realdata/mdt1/team78pipelines/canpipe/live/ref/Homo_sapiens/GRCH37d5/star/e75/ensembl.gtf")
+	viper.SetDefault(
+		"star_exec",
+		"/nfs/users/nfs_r/rr11/Tools/STAR-2.5.2a/bin/Linux_x86_64_static/STAR",
+	)
+	viper.SetDefault(
+		"star_genome_dir",
+		"/lustre/scratch119/casm/team78pipelines/reference/human/GRCh37d5_ERCC92/star/75/",
+	)
+	viper.SetDefault(
+		"genome_annot",
+		"/lustre/scratch119/realdata/mdt1/team78pipelines/canpipe/live/ref/Homo_sapiens/GRCH37d5/star/e75/ensembl.gtf",
+	)
 
 	// read in config file if found, else use defaults
 	//if err := viper.ReadInConfig(); err != nil {
@@ -179,6 +218,7 @@ func main() {
 	//}
 
 	samtools_exec = viper.GetString("samtools_exec")
+	Rscript_exec = viper.GetString("Rscript_exec")
 	umitools_exec := viper.GetString("umitools_exec")
 	//star_exec := viper.GetString("star_exec")
 	//star_genome_dir := viper.GetString("star_genome_dir")
@@ -202,7 +242,6 @@ func main() {
 
 	mt_subset_bam := output_dir + "/MT_subset.bam"
 	threads = "4"
-
 
 	current_step = 1
 	if fileExists(output_dir + fmt.Sprintf("checkpoint_%d.json", current_step)) {
@@ -235,7 +274,6 @@ func main() {
 		writeCheckpoint(barcode_list, current_step)
 	}
 
-
 	current_step = 2
 	// if bam has been subset to MT already then skip to next step
 	if fileExists(output_dir + fmt.Sprintf("checkpoint_%d.json", current_step)) {
@@ -266,7 +304,6 @@ func main() {
 		} else {
 			master_barcode.Masterbam_original_quickcheck_success = true
 		}
-
 
 		log.Println("Subsetting bam file to MT only")
 
@@ -329,7 +366,6 @@ func main() {
 		writeCheckpoint(barcode_list, current_step)
 	}
 
-
 	current_step = 4
 	if fileExists(output_dir + fmt.Sprintf("checkpoint_%d.json", current_step)) {
 		jsonFile, err := os.Open(output_dir + fmt.Sprintf("checkpoint_%d.json", current_step))
@@ -354,12 +390,12 @@ func main() {
 			"-R'select[mem>80000] rusage[mem=80000]'", "-M80000",
 			umitools_exec, "dedup",
 			"--paired",
-			"--chrom","MT",
+			"--chrom", "MT",
 			"--extract-umi-method", "tag",
 			"--umi-tag", "UB",
 			"--per-cell", "--cell-tag", "CB",
 			"-I", (&barcode_list[0]).Masterbam_MT_subset,
-			"-S",(&barcode_list[0]).Masterbam_UMI_deduped).CombinedOutput()
+			"-S", (&barcode_list[0]).Masterbam_UMI_deduped).CombinedOutput()
 
 		if err != nil {
 			// Display everything we got if error.
@@ -368,7 +404,6 @@ func main() {
 			log.Printf("Got command status: %s\n", err.Error())
 			return
 		}
-
 
 		writeCheckpoint(barcode_list, current_step)
 	}
@@ -417,7 +452,7 @@ func main() {
 			samtools_exec, "view", (&barcode_list[0]).Masterbam_UMI_deduped,
 			"|", "grep", "-oE", "CB:Z:[acgtnACGTN-]+[1-9]",
 			"|", "sort", "-u", "--parallel", threads,
-			">", output_dir + "unique_barcodes.tsv").CombinedOutput()
+			"|", "gzip", ">", output_dir+"unique_barcodes.tsv.gz").CombinedOutput()
 
 		if err != nil {
 			// Display everything we got if error.
@@ -429,49 +464,6 @@ func main() {
 
 		writeCheckpoint(barcode_list, current_step)
 	}
-
-
-
-	//current_step = 6
-	//if fileExists(output_dir + fmt.Sprintf("checkpoint_%d.json", current_step)) {
-		//jsonFile, err := os.Open(output_dir + fmt.Sprintf("checkpoint_%d.json", current_step))
-		//byteValue, _ := ioutil.ReadAll(jsonFile)
-		//err = json.Unmarshal([]byte(byteValue), &barcode_list)
-		//if err != nil {
-			//panic(err)
-		//}
-
-		//log.Println(fmt.Sprintf("Checkpoint exists for step %d, loading progress", current_step))
-
-	//} else {
-		//log.Println(fmt.Sprintf("Starting step %d", current_step))
-
-		//log.Println("Parsing unique barcodes file into memory")
-
-		//barcodefile, err := os.Open(output_dir + "unique_barcodes.tsv.gz")
-		//if err != nil {
-			//log.Fatal(err)
-		//}
-		//defer barcodefile.Close()
-
-		//gr, err := gzip.NewReader(barcodefile)
-		//if err != nil {
-			//log.Fatal(err)
-		//}
-		//defer gr.Close()
-
-		//barcodefile_scanner := bufio.NewScanner(gr)
-		//for barcodefile_scanner.Scan() {
-			//// remove CB:Z: prefix to get just the cell barcode
-			//barcode_str := strings.Trim(barcodefile_scanner.Text(), "CB:Z:")
-			//new_barcode := barcode{Name: barcode_str}
-			//barcode_list = append(barcode_list, new_barcode)
-		//}
-
-		//writeCheckpoint(barcode_list, current_step)
-	//}
-
-
 
 	current_step = 7
 	if fileExists(output_dir + fmt.Sprintf("checkpoint_%d.json", current_step)) {
@@ -485,38 +477,130 @@ func main() {
 		log.Println(fmt.Sprintf("Checkpoint exists for step %d, loading progress", current_step))
 
 	} else {
+		log.Println(fmt.Sprintf("Starting step %d", current_step))
 
-		barcode_file := output_dir + "unique_barcodes.tsv"
-
-		err := os.Mkdir(output_dir + "/split_output/", 0755)
+		//log.Println("Parsing unique barcodes file into memory")
+		barcodefile, err := os.Open(output_dir + "unique_barcodes.tsv.gz")
 		if err != nil {
 			log.Fatal(err)
 		}
+		defer barcodefile.Close()
 
-		output, err := exec.Command(
-			"echo",
-			"bsub",
-			"-R'span[hosts=1]'",
-			"-o", output_dir + "/split_output/%J/" + "splitbam.%I.out",
-			"-e", output_dir + "/split_output/%J/" + "splitbam.%I.err",
-			"-R'select[mem>=5000] rusage[mem=5000]'", "-M5000",
-			"-n", "12",
-			"-J'splitbam[1-20]%10'",
-			"bash","subsetbam_inner_script.sh", (&barcode_list[0]).Masterbam_UMI_deduped, barcode_file, output_dir + "/split_output/%J/").CombinedOutput()
-			log.Println(string(output))
-
-
-			//"-J\"splitbam[1-`wc -l<"+barcode_file+"`]%10\"",
+		gr, err := gzip.NewReader(barcodefile)
 		if err != nil {
-			// Display everything we got if error.
-			log.Println("Error when running command.  Output:")
-			log.Println(string(output))
-			log.Printf("Got command status: %s\n", err.Error())
-			return
+			log.Fatal(err)
+		}
+		defer gr.Close()
+
+		barcodefile_scanner := bufio.NewScanner(gr)
+		for barcodefile_scanner.Scan() {
+			// remove CB:Z: prefix to get just the cell barcode
+			barcode_str := strings.Trim(barcodefile_scanner.Text(), "CB:Z:")
+			new_barcode := barcode{Name: barcode_str}
+
+			barcode_list = append(barcode_list, new_barcode)
 		}
 
+		// chunk the list of barcodes into groups of 1000
+		chunked_barcode_list := chunkSlice(barcode_list[1:], 1000)
 
-		//writeCheckpoint(barcode_list, current_step)
+		for chunk_i, chunk := range chunked_barcode_list {
+
+			chunk_cell_map = make(map[string]string)
+			chunk_output := output_dir + "/chunk_" + strconv.Itoa(chunk_i) + "/"
+			err := os.Mkdir(chunk_output, 0755)
+			if err != nil {
+				log.Fatal(err)
+			}
+
+			for i := range chunk {
+				cell := &chunk[i]
+
+				cell.Splitbam_jobout = chunk_output + "cellsplit_" + cell.Name + ".o"
+				cell.Splitbam_joberr = chunk_output + "cellsplit_" + cell.Name + ".e"
+				cell.Splitbam_bamout = chunk_output + "cell_" + cell.Name + ".bam"
+				cell.Splitbam_bamindex = cell.Splitbam_bamout + ".bai"
+				cell.Splitbam_barcodefile = chunk_output + "barcode_" + cell.Name + ".txt"
+
+				// write a file with barcode inside for splitbam
+				job_barcode_out, err := os.Create(cell.Splitbam_barcodefile)
+				if err != nil {
+					log.Fatal(err)
+				}
+				defer job_barcode_out.Close()
+				_, err = job_barcode_out.WriteString(cell.Name + "\n")
+
+				// add this barcode to list of current jobs
+				chunk_cell_map[cell.Name] = cell.Splitbam_jobout
+
+				// split bam to current barcode
+				output, err := exec.Command(
+					"bsub",
+					"-o", cell.Splitbam_jobout,
+					"-e", cell.Splitbam_joberr,
+					"-R'select[mem>5000] rusage[mem=5000]'", "-M5000",
+					"-n", "12",
+					"subset-bam", "--cores", "12",
+					"--bam", (&barcode_list[0]).Masterbam_UMI_deduped,
+					"--cell-barcodes", cell.Splitbam_barcodefile,
+					"--out-bam", cell.Splitbam_bamout).CombinedOutput()
+
+				if err != nil {
+					// Display everything we got if error.
+					log.Println("Error when running command.  Output:")
+					log.Println(string(output))
+					log.Printf("Got command status: %s\n", err.Error())
+					return
+				}
+			}
+
+			// wait for that chunks splits to finish
+			bjobsIsCompleted(chunk_cell_map, "Splitbam_successful", &barcode_list, []string{"Splitbam_jobout", "Splitbam_joberr", "Splitbam_barcodefile"})
+
+			// index the split bam files
+			for i := range chunk {
+				cell := &chunk[i]
+				indexBam(cell.Splitbam_bamout)
+				cell.Splitbam_indexed = true
+			}
+
+			// run variant calling on the bam files
+			for i := range chunk {
+				cell := &chunk[i]
+
+				cell.Rvarcall_jobout = chunk_output + "cellsplit_" + cell.Name + ".o"
+				cell.Rvarcall_joberr = chunk_output + "cellsplit_" + cell.Name + ".e"
+				cell.Rvarcall_out = chunk_output
+
+				// add this barcode to list of current jobs
+				chunk_cell_map[cell.Name] = cell.Rvarcall_jobout
+
+				// split bam to current barcode
+				output, err := exec.Command(
+					"bsub",
+					"-o", cell.Rvarcall_jobout,
+					"-e", cell.Rvarcall_joberr,
+					"-R'select[mem>5000] rusage[mem=5000]'", "-M5000",
+					"-n", "1",
+					Rscript_exec, "callVars.R",
+					cell.Splitbam_bamout,
+					cell.Rvarcall_out).CombinedOutput()
+
+				if err != nil {
+					// Display everything we got if error.
+					log.Println("Error when running command.  Output:")
+					log.Println(string(output))
+					log.Printf("Got command status: %s\n", err.Error())
+					return
+				}
+
+			}
+			// wait for variant calls to finish
+			bjobsIsCompleted(chunk_cell_map, "Rvarcall_command_successful", &barcode_list, []string{"Rvarcall_jobout", "Rvarcall_joberr", "Splitbam_bamout", "Splitbam_bamindex"})
+
+		}
+		writeCheckpoint(barcode_list, current_step)
+
 	}
 
 
