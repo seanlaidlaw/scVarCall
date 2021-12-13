@@ -1,5 +1,10 @@
 package main
 
+// Only MT will be kept from bam with
+// samtools view $bam chrMT -b > $mt_bam
+// UMIs will be remove with
+// umi_tools dedup --extract-umi-method=tag --umi-tag=UB -I $mt_bam $dedup_bam
+
 import (
 	"encoding/json"
 	"flag"
@@ -8,24 +13,37 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"reflect"
 	"strings"
+	"bufio"
+	"compress/gzip"
 	"sync"
+	"time"
 
 	"github.com/spf13/viper"
 )
 
 // PIPELINE STEPS
 // Sequencial steps
-// 1. Split bam file to only MT chromosome
-// 2. Deduplicate UMIs from bam file
-// 3. Assess what barcodes are inside bam file
+// 0. Split bam file to only MT chromosome
+// 0. Deduplicate UMIs from bam file
+// 0. Assess what barcodes are inside bam file
 
 // Parallel steps
-// 4. Split bam file by cell barcode
-// 5. Samtools Quickcheck split bams
-// 6. Sort bam file
-// 7. Index bam file
-// 8. Call all variants (not just second-max)
+// 0. Split bam file by cell barcode
+// 0. Samtools Quickcheck split bams
+// 0. Sort bam file
+// 0. Index bam file
+// 0. Call all variants (not just second-max)
+
+// 0. Download CRAM files
+// 0. Download imeta files for each cram file
+// 0. Establish unique sample names exist
+// 0. Convert the CRAM files to fastq
+// 0. Symlink the fastqs to two different folders depending on 'Library_type'
+// 0. Align extracted fastqs with STAR or BWA depending on 'Library_type'
+// 0. Index realigned bam files
+// 0. Generate counts matrix of RNA bams
 
 // fileExists checks if a file exists and is not a directory before we
 // try using it to prevent further errors.
@@ -36,9 +54,18 @@ func fileExists(filename string) bool {
 	}
 	return !info.IsDir()
 }
+func stringInSlice(a string, list []string) bool {
+	for _, b := range list {
+		if b == a {
+			return true
+		}
+	}
+	return false
+}
 
-func writeCheckpoint(barcode_list []barcode_file, step int) {
+func writeCheckpoint(barcode_list []barcode, step int) {
 	checkpoint_file := fmt.Sprintf("checkpoint_%d.json", step)
+	checkpoint_file = output_dir + checkpoint_file
 	rankingsJson, _ := json.MarshalIndent(barcode_list, "", "  ")
 	err := ioutil.WriteFile(checkpoint_file, rankingsJson, 0644)
 	if err != nil {
@@ -47,12 +74,91 @@ func writeCheckpoint(barcode_list []barcode_file, step int) {
 	log.Println(fmt.Sprintf("Checkpoint saved for step %d", step))
 }
 
-type barcode_file struct {
-	Cell_barcode string
-	Patient_ID   string
+func bjobsIsCompleted(submitted_jobs_map map[string]string, attribute_name string, barcode_list *[]barcode) {
+	// while there are still jobs in submitted_jobs_map, iterate over reading through all job outputs and only leave when all have completed successfully
+	for len(submitted_jobs_map) > 0 {
+		for i := range *barcode_list {
+			func_cram := &((*barcode_list)[i])
+			bjobs_output_filename := submitted_jobs_map[func_cram.Name]
+
+			dat, err := ioutil.ReadFile(bjobs_output_filename)
+			if err == nil {
+				// when job has finished (either successfully or with exit code, remove from the waiting list 'submitted_jobs_map'
+				if strings.Contains(string(dat), "Terminated at") {
+					delete(submitted_jobs_map, func_cram.Name)
+
+					// if job has finished and successfully completed then set the specified attribute_name to true
+					if strings.Contains(string(dat), "Successfully completed.") {
+						reflect.ValueOf(func_cram).Elem().FieldByName(attribute_name).SetBool(true)
+
+						os.Remove(func_cram.Splitbam_jobout)
+						os.Remove(func_cram.Splitbam_joberr)
+						os.Remove(func_cram.Splitbam_barcodefile)
+
+					} else {
+						log.Println(fmt.Sprintf("Error with bsub job: %s", bjobs_output_filename))
+					}
+				}
+			}
+		}
+		// sleep for 5 seconds after going through every job's output before retrying
+fmt.Println(len(submitted_jobs_map))
+		time.Sleep(5 * time.Second)
+	}
 }
 
-var barcode_list []barcode_file
+//func quickcheck_alignments(barcode_list []barcode, i int, samtools_exec string) {
+//	cram := &barcode_list[i]
+//
+//	bam_filename := cram.Realigned_bam_path
+//	output, err := exec.Command(samtools_exec, "quickcheck", bam_filename).CombinedOutput()
+//
+//	if err != nil {
+//		// Display everything we got if error.
+//		log.Println("Error when running command.  Output:")
+//		log.Println(string(output))
+//		log.Printf("Got command status: %s\n", err.Error())
+//		cram.Realigned_quickcheck_success = false
+//	} else {
+//		cram.Realigned_quickcheck_success = true
+//	}
+//	wg.Done()
+//}
+
+func indexBam(bam_filename string) {
+	output, err := exec.Command(samtools_exec, "index", bam_filename).CombinedOutput()
+
+	if err != nil {
+		// Display everything we got if error.
+		log.Println("Error when running command.  Output:")
+		log.Println(string(output))
+		log.Printf("Got command status: %s\n", err.Error())
+	}
+}
+
+type barcode struct {
+	Name string
+	Output_dir string
+	Masterbam_original string
+	Masterbam_original_quickcheck_success bool
+	Masterbam_MT_subset string
+	Masterbam_MT_subset_quickcheck_success bool
+	Masterbam_MT_subset_index_success bool
+	Masterbam_UMI_deduped string
+	Masterbam_UMI_deduped_success string
+	Masterbam_UMI_deduped_quickcheck_success bool
+	Masterbam_UMI_deduped_index_success bool
+	Splitbam_jobout string
+	Splitbam_joberr string
+	Splitbam_bamout string
+	Splitbam_barcodefile string
+	Splitbam_successful bool
+}
+
+var barcode_list []barcode
+
+var output_dir string
+var samtools_exec string
 
 var wg sync.WaitGroup
 
@@ -64,19 +170,24 @@ func main() {
 	viper.AddConfigPath("$HOME/.config/") // if not found then look in .config folder
 
 	viper.SetDefault("samtools_exec", "/software/sciops/pkgg/samtools/1.10.0/bin/samtools")
+	viper.SetDefault("umitools_exec", "/software/teamtrynka/conda/trynka-base/bin/umi_tools")
 	viper.SetDefault("star_exec", "/nfs/users/nfs_r/rr11/Tools/STAR-2.5.2a/bin/Linux_x86_64_static/STAR")
 	viper.SetDefault("star_genome_dir", "/lustre/scratch119/casm/team78pipelines/reference/human/GRCh37d5_ERCC92/star/75/")
 	viper.SetDefault("genome_annot", "/lustre/scratch119/realdata/mdt1/team78pipelines/canpipe/live/ref/Homo_sapiens/GRCH37d5/star/e75/ensembl.gtf")
 
 	// read in config file if found, else use defaults
-	if err := viper.ReadInConfig(); err != nil {
-		log.Fatalln("Unable to read config file")
-	}
+	//if err := viper.ReadInConfig(); err != nil {
+	//	log.Fatalln("Unable to read config file")
+	//}
 
-	samtools_exec := viper.GetString("samtools_exec")
+	samtools_exec = viper.GetString("samtools_exec")
+	umitools_exec := viper.GetString("umitools_exec")
+	//star_exec := viper.GetString("star_exec")
+	//star_genome_dir := viper.GetString("star_genome_dir")
+	//featurecounts_exec := viper.GetString("featurecounts_exec")
+	//genome_annot := viper.GetString("genome_annot")
 
 	var input string
-	var output_dir string
 	var threads string
 	var current_step int
 
@@ -88,11 +199,16 @@ func main() {
 	if (strings.TrimSpace(input) == "input") || (strings.TrimSpace(output_dir) == "output_dir") {
 		log.Fatalln("No input or output_dir argument was provided")
 	}
+	// make sure output dir ends in slash so paths work correctly when appending filenames
+	output_dir = output_dir + "/"
 
-	current_step = 0
-	// if bam has been subset to MT already then skip to next step
-	if fileExists(fmt.Sprintf("checkpoint_%d.json", current_step)) {
-		jsonFile, err := os.Open(fmt.Sprintf("checkpoint_%d.json", current_step))
+	mt_subset_bam := output_dir + "/MT_subset.bam"
+	threads = "4"
+
+
+	current_step = 1
+	if fileExists(output_dir + fmt.Sprintf("checkpoint_%d.json", current_step)) {
+		jsonFile, err := os.Open(output_dir + fmt.Sprintf("checkpoint_%d.json", current_step))
 		byteValue, _ := ioutil.ReadAll(jsonFile)
 		err = json.Unmarshal([]byte(byteValue), &barcode_list)
 		if err != nil {
@@ -104,19 +220,206 @@ func main() {
 	} else {
 		log.Println(fmt.Sprintf("Starting step %d", current_step))
 
-		log.Println("Subsetting bam file to MT only")
+		log.Println("Defining input and output paths for master bam")
 		err := os.Mkdir(output_dir, 0755)
 		if err != nil {
 			log.Fatal(err)
 		}
-		mt_subset_bam := output_dir + "/MT_subset.bam"
+
+		// define a "master" barcode for the bam file that is to be split
+		// this isnt a barcode per se, but the origin of the barcodes
+		var master_barcode barcode
+		master_barcode.Name = "MASTER"
+		master_barcode.Output_dir = output_dir
+		master_barcode.Masterbam_original = input
+
+		barcode_list = append(barcode_list, master_barcode)
+		writeCheckpoint(barcode_list, current_step)
+	}
+
+
+	current_step = 2
+	// if bam has been subset to MT already then skip to next step
+	if fileExists(output_dir + fmt.Sprintf("checkpoint_%d.json", current_step)) {
+		jsonFile, err := os.Open(output_dir + fmt.Sprintf("checkpoint_%d.json", current_step))
+		byteValue, _ := ioutil.ReadAll(jsonFile)
+		err = json.Unmarshal([]byte(byteValue), &barcode_list)
+		if err != nil {
+			panic(err)
+		}
+
+		log.Println(fmt.Sprintf("Checkpoint exists for step %d, loading progress", current_step))
+
+	} else {
+		log.Println(fmt.Sprintf("Starting step %d", current_step))
+
+		master_barcode := &barcode_list[0]
+
+		log.Println("Quickchecking input bam file")
+
+		output, err := exec.Command(samtools_exec, "quickcheck", master_barcode.Masterbam_original).CombinedOutput()
+
+		if err != nil {
+			// Display everything we got if error.
+			log.Println("Error when running command.  Output:")
+			log.Println(string(output))
+			log.Printf("Got command status: %s\n", err.Error())
+			master_barcode.Masterbam_original_quickcheck_success = false
+		} else {
+			master_barcode.Masterbam_original_quickcheck_success = true
+		}
+
+
+		log.Println("Subsetting bam file to MT only")
+
+		output, err = exec.Command(
+			"bsub",
+			"-I",
+			"-R'select[mem>50000] rusage[mem=50000]'", "-M50000",
+			"-n", threads,
+			samtools_exec, "view",
+			input, "MT",
+			"-b", "-@", threads,
+			">", mt_subset_bam).CombinedOutput()
+
+		if err != nil {
+			// Display everything we got if error.
+			log.Println("Error when running command.  Output:")
+			log.Println(string(output))
+			log.Printf("Got command status: %s\n", err.Error())
+			return
+		}
+
+		master_barcode.Masterbam_MT_subset = mt_subset_bam
+
+		log.Println("Quickchecking subset bam file")
+
+		output, err = exec.Command(samtools_exec, "quickcheck", master_barcode.Masterbam_MT_subset).CombinedOutput()
+
+		if err != nil {
+			// Display everything we got if error.
+			log.Println("Error when running command.  Output:")
+			log.Println(string(output))
+			log.Printf("Got command status: %s\n", err.Error())
+			master_barcode.Masterbam_MT_subset_quickcheck_success = false
+		} else {
+			master_barcode.Masterbam_MT_subset_quickcheck_success = true
+		}
+
+		writeCheckpoint(barcode_list, current_step)
+	}
+
+	current_step = 3
+	if fileExists(output_dir + fmt.Sprintf("checkpoint_%d.json", current_step)) {
+		jsonFile, err := os.Open(output_dir + fmt.Sprintf("checkpoint_%d.json", current_step))
+		byteValue, _ := ioutil.ReadAll(jsonFile)
+		err = json.Unmarshal([]byte(byteValue), &barcode_list)
+		if err != nil {
+			panic(err)
+		}
+
+		log.Println(fmt.Sprintf("Checkpoint exists for step %d, loading progress", current_step))
+
+	} else {
+		log.Println(fmt.Sprintf("Starting step %d", current_step))
+
+		log.Println("Indexing newly created MT subset bam")
+
+		indexBam((&barcode_list[0]).Masterbam_MT_subset)
+		(&barcode_list[0]).Masterbam_MT_subset_index_success = true
+
+		writeCheckpoint(barcode_list, current_step)
+	}
+
+
+	current_step = 4
+	if fileExists(output_dir + fmt.Sprintf("checkpoint_%d.json", current_step)) {
+		jsonFile, err := os.Open(output_dir + fmt.Sprintf("checkpoint_%d.json", current_step))
+		byteValue, _ := ioutil.ReadAll(jsonFile)
+		err = json.Unmarshal([]byte(byteValue), &barcode_list)
+		if err != nil {
+			panic(err)
+		}
+
+		log.Println(fmt.Sprintf("Checkpoint exists for step %d, loading progress", current_step))
+
+	} else {
+		log.Println(fmt.Sprintf("Starting step %d", current_step))
+
+		log.Println("Deduplicating UMIs")
+		deduped_bam := output_dir + "/MT_subset_umi_deduped.bam"
+		(&barcode_list[0]).Masterbam_UMI_deduped = deduped_bam
+
+		output, err := exec.Command(
+			"bsub",
+			"-I",
+			"-R'select[mem>80000] rusage[mem=80000]'", "-M80000",
+			umitools_exec, "dedup",
+			"--paired",
+			"--chrom","MT",
+			"--extract-umi-method", "tag",
+			"--umi-tag", "UB",
+			"--per-cell", "--cell-tag", "CB",
+			"-I", (&barcode_list[0]).Masterbam_MT_subset,
+			"-S",(&barcode_list[0]).Masterbam_UMI_deduped).CombinedOutput()
+
+		if err != nil {
+			// Display everything we got if error.
+			log.Println("Error when running command.  Output:")
+			log.Println(string(output))
+			log.Printf("Got command status: %s\n", err.Error())
+			return
+		}
+
+
+		writeCheckpoint(barcode_list, current_step)
+	}
+
+	current_step = 4
+	if fileExists(output_dir + fmt.Sprintf("checkpoint_%d.json", current_step)) {
+		jsonFile, err := os.Open(output_dir + fmt.Sprintf("checkpoint_%d.json", current_step))
+		byteValue, _ := ioutil.ReadAll(jsonFile)
+		err = json.Unmarshal([]byte(byteValue), &barcode_list)
+		if err != nil {
+			panic(err)
+		}
+
+		log.Println(fmt.Sprintf("Checkpoint exists for step %d, loading progress", current_step))
+
+	} else {
+		log.Println(fmt.Sprintf("Starting step %d", current_step))
+
+		log.Println("Indexing newly created deduped bam")
+
+		indexBam((&barcode_list[0]).Masterbam_UMI_deduped)
+		(&barcode_list[0]).Masterbam_UMI_deduped_index_success = true
+
+		writeCheckpoint(barcode_list, current_step)
+	}
+
+	current_step = 5
+	if fileExists(output_dir + fmt.Sprintf("checkpoint_%d.json", current_step)) {
+		jsonFile, err := os.Open(output_dir + fmt.Sprintf("checkpoint_%d.json", current_step))
+		byteValue, _ := ioutil.ReadAll(jsonFile)
+		err = json.Unmarshal([]byte(byteValue), &barcode_list)
+		if err != nil {
+			panic(err)
+		}
+
+		log.Println(fmt.Sprintf("Checkpoint exists for step %d, loading progress", current_step))
+
+	} else {
+		log.Println(fmt.Sprintf("Starting step %d", current_step))
+		log.Println("Reading barcodes in deduped and subset bam input")
 		output, err := exec.Command(
 			"bsub",
 			"-I",
 			"-R'select[mem>50000] rusage[mem=50000]'", "-M50000",
 			"-n", threads,
-			samtools_exec, "view", "chrMT", "-b",
-			"-@", threads, ">", mt_subset_bam).CombinedOutput()
+			samtools_exec, "view", (&barcode_list[0]).Masterbam_UMI_deduped,
+			"|", "grep", "-oE", "CB:Z:[acgtnACGTN-]+[1-9]",
+			"|", "sort", "-u", "--parallel", threads,
+			"|", "gzip", ">", output_dir + "unique_barcodes.tsv.gz").CombinedOutput()
 
 		if err != nil {
 			// Display everything we got if error.
@@ -129,4 +432,380 @@ func main() {
 		writeCheckpoint(barcode_list, current_step)
 	}
 
+
+
+	current_step = 6
+	if fileExists(output_dir + fmt.Sprintf("checkpoint_%d.json", current_step)) {
+		jsonFile, err := os.Open(output_dir + fmt.Sprintf("checkpoint_%d.json", current_step))
+		byteValue, _ := ioutil.ReadAll(jsonFile)
+		err = json.Unmarshal([]byte(byteValue), &barcode_list)
+		if err != nil {
+			panic(err)
+		}
+
+		log.Println(fmt.Sprintf("Checkpoint exists for step %d, loading progress", current_step))
+
+	} else {
+		log.Println(fmt.Sprintf("Starting step %d", current_step))
+
+		log.Println("Parsing unique barcodes file into memory")
+
+		barcodefile, err := os.Open(output_dir + "unique_barcodes.tsv.gz")
+		if err != nil {
+			log.Fatal(err)
+		}
+		defer barcodefile.Close()
+
+		gr, err := gzip.NewReader(barcodefile)
+		if err != nil {
+			log.Fatal(err)
+		}
+		defer gr.Close()
+
+		barcodefile_scanner := bufio.NewScanner(gr)
+		for barcodefile_scanner.Scan() {
+			// remove CB:Z: prefix to get just the cell barcode
+			barcode_str := strings.Trim(barcodefile_scanner.Text(), "CB:Z:")
+			new_barcode := barcode{Name: barcode_str}
+			barcode_list = append(barcode_list, new_barcode)
+		}
+
+		writeCheckpoint(barcode_list, current_step)
+	}
+
+
+
+	current_step = 7
+	if fileExists(output_dir + fmt.Sprintf("checkpoint_%d.json", current_step)) {
+		jsonFile, err := os.Open(output_dir + fmt.Sprintf("checkpoint_%d.json", current_step))
+		byteValue, _ := ioutil.ReadAll(jsonFile)
+		err = json.Unmarshal([]byte(byteValue), &barcode_list)
+		if err != nil {
+			panic(err)
+		}
+
+		log.Println(fmt.Sprintf("Checkpoint exists for step %d, loading progress", current_step))
+
+	} else {
+
+	cellsplit_map := make(map[string]string)
+
+		for i := range barcode_list {
+			cell := &barcode_list[i]
+			if (len(cellsplit_map) < 10) {
+				if (cell.Name != "MASTER") {
+					job_out := output_dir + "cellsplit_" + cell.Name + ".o"
+					job_err := output_dir + "cellsplit_" + cell.Name + ".e"
+					job_bam := output_dir + "cell_" + cell.Name + ".bam"
+
+					cellsplit_map[cell.Name] = job_out
+
+
+					job_barcode_filename := output_dir+ "barcode_" + cell.Name + ".txt"
+					job_barcode_out, err := os.Create(job_barcode_filename)
+					if err != nil {
+						log.Fatal(err)
+					}
+					defer job_barcode_out.Close()
+
+					_, err = job_barcode_out.WriteString(cell.Name+"\n")
+
+					cell.Splitbam_jobout = job_out
+					cell.Splitbam_joberr = job_err
+					cell.Splitbam_barcodefile = job_bam
+					cell.Splitbam_bamout = job_bam
+
+					output, err := exec.Command(
+						"bsub",
+						"-o", job_out,
+						"-e", job_err,
+						"-R'select[mem>5000] rusage[mem=5000]'", "-M5000",
+						"-n", "12",
+						"subset-bam", "--cores", "12",
+						"--bam", (&barcode_list[0]).Masterbam_UMI_deduped,
+						"--cell-barcodes", job_barcode_filename,
+						"--out-bam", job_bam).CombinedOutput()
+
+					if err != nil {
+						// Display everything we got if error.
+						log.Println("Error when running command.  Output:")
+						log.Println(string(output))
+						log.Printf("Got command status: %s\n", err.Error())
+						return
+					}
+
+
+				}
+			} else {
+
+				bjobsIsCompleted(cellsplit_map, "Splitbam_successful", &barcode_list)
+			}
+		}
+
+		//writeCheckpoint(barcode_list, current_step)
+	}
+
+
+	//// if symlinks already created then load session information and continue
+	//// if fastq have already been split then load checkpoint instead of rerunning
+	//if fileExists(fmt.Sprintf("checkpoint_%d.json", current_step)) {
+	//jsonFile, err := os.Open(fmt.Sprintf("checkpoint_%d.json", current_step))
+	//byteValue, _ := ioutil.ReadAll(jsonFile)
+	//err = json.Unmarshal([]byte(byteValue), &barcode_list)
+	//if err != nil {
+	//panic(err)
+	//}
+
+	//log.Println(fmt.Sprintf("Checkpoint exists for step %d, loading progress", current_step))
+
+	//} else {
+
+	//log.Println("Symlinking fastq into different folders based on library_type")
+	//for i := range barcode_list {
+	//cram := &barcode_list[i]
+	//if cram.Fastq_extracted_success && cram.Library_type != "" {
+	//lib_type_dir := strings.ReplaceAll(cram.Library_type, " ", "_")
+	//lib_type_dir = "C_Split_by_Library_Type/" + lib_type_dir
+	//_ = os.MkdirAll(lib_type_dir, 0755)
+	//os.Symlink("../../"+cram.Fastq_1_path, lib_type_dir+"/"+cram.Sample_name+".1.fq.gz")
+	//os.Symlink("../../"+cram.Fastq_2_path, lib_type_dir+"/"+cram.Sample_name+".2.fq.gz")
+	//cram.Symlinked_fq_1 = lib_type_dir + "/" + cram.Sample_name + ".1.fq.gz"
+	//cram.Symlinked_fq_2 = lib_type_dir + "/" + cram.Sample_name + ".2.fq.gz"
+	//}
+	//}
+
+	//writeCheckpoint(barcode_list, current_step)
+	//}
+
+	//current_step = 7
+	//// if alignments already performed then load session information and continue
+	//if fileExists(fmt.Sprintf("checkpoint_%d.json", current_step)) {
+	//jsonFile, err := os.Open(fmt.Sprintf("checkpoint_%d.json", current_step))
+	//byteValue, _ := ioutil.ReadAll(jsonFile)
+	//err = json.Unmarshal([]byte(byteValue), &barcode_list)
+	//if err != nil {
+	//panic(err)
+	//}
+
+	//log.Println(fmt.Sprintf("Checkpoint exists for step %d, loading progress", current_step))
+
+	//} else {
+
+	//_ = os.MkdirAll("D_realignments/", 0755)
+	//log.Println("Running alignments between extracted fastq and specified reference")
+	//realignment_map := make(map[string]string)
+	//for i := range barcode_list {
+	//cram := &barcode_list[i]
+	//if cram.Symlinked_fq_1 != "" && cram.Symlinked_fq_2 != "" {
+
+	//out_folder := "D_realignments/" + strings.ReplaceAll(cram.Library_type, " ", "_") + "/"
+	//_ = os.MkdirAll(out_folder, 0755)
+
+	//bam_output := out_folder + cram.Sample_name + ".bam"
+	//job_out := out_folder + "/D_realignement_RNA_" + cram.Sample_name + ".o"
+	//job_err := out_folder + "/D_realignement_RNA_" + cram.Sample_name + ".e"
+
+	//if stringInSlice(cram.Library_type, star_align_libraries) {
+	//output, err := exec.Command(
+	//"bsub",
+	//"-o", job_out,
+	//"-e", job_err,
+	//"-R'select[mem>50000] rusage[mem=50000]'", "-M50000",
+	//"-n", "10",
+	//star_exec, "--runThreadN", "10",
+	//"--outSAMattributes", "NH", "HI", "NM", "MD",
+	//"--limitBAMsortRAM", "31532137230",
+	//"--outSAMtype", "BAM", "SortedByCoordinate",
+	//"--genomeDir", star_genome_dir,
+	//"--readFilesCommand", "zcat",
+	//"--outFileNamePrefix", out_folder+"/"+cram.Filename,
+	//"--readFilesIn", cram.Symlinked_fq_1, cram.Symlinked_fq_2,
+	//"--outStd", "BAM_SortedByCoordinate",
+	//"|", samtools_exec, "sort", "-@3", "-l7", "-o", bam_output).CombinedOutput()
+
+	//if err != nil {
+	//// Display everything we got if error.
+	//log.Println("Error when running command.  Output:")
+	//log.Println(string(output))
+	//log.Printf("Got command status: %s\n", err.Error())
+	//return
+	//}
+
+	//cram.Realigned_bam_path = bam_output
+	//realignment_map[cram.Filename] = job_out
+
+	//} else if stringInSlice(cram.Library_type, bwa_align_libraries) {
+	//output, err := exec.Command(
+	//"bsub",
+	//"-o", job_out,
+	//"-e", job_err,
+	//"-R'select[mem>50000] rusage[mem=50000]'", "-M50000",
+	//"-n", "10",
+	//bwa_exec, "mem", "-t", "10",
+	//bwa_genome_ref,
+	//cram.Symlinked_fq_1,
+	//cram.Symlinked_fq_2,
+	//"|", samtools_exec, "sort", "-@3", "-l7", "-o", bam_output).CombinedOutput()
+
+	//if err != nil {
+	//// Display everything we got if error.
+	//log.Println("Error when running command.  Output:")
+	//log.Println(string(output))
+	//log.Printf("Got command status: %s\n", err.Error())
+	//return
+	//}
+
+	//cram.Realigned_bam_path = bam_output
+	//realignment_map[cram.Filename] = job_out
+	//}
+	//}
+	//}
+
+	//// check on alignment jobs until they have finished
+	//bjobsIsCompleted(realignment_map, "Realigned_succesful", &barcode_list)
+
+	//writeCheckpoint(barcode_list, current_step)
+	//}
+
+	//current_step = 8
+	//// if quickcheck has already been performed then load session information and continue
+	//if fileExists(fmt.Sprintf("checkpoint_%d.json", current_step)) {
+	//jsonFile, err := os.Open(fmt.Sprintf("checkpoint_%d.json", current_step))
+	//byteValue, _ := ioutil.ReadAll(jsonFile)
+	//err = json.Unmarshal([]byte(byteValue), &barcode_list)
+	//if err != nil {
+	//panic(err)
+	//}
+
+	//log.Println(fmt.Sprintf("Checkpoint exists for step %d, loading progress", current_step))
+
+	//} else {
+	//log.Println("Running samtools quickcheck on completed bams")
+
+	//for i := range barcode_list {
+	//cram := &barcode_list[i]
+	//if cram.Realigned_succesful {
+	//wg.Add(1)
+	//go quickcheck_alignments(barcode_list, i, samtools_exec)
+	//}
+	//}
+	//wg.Wait() // wait until all quickcheck processes have finished
+
+	//writeCheckpoint(barcode_list, current_step)
+	//}
+
+	//current_step = 9
+	//// if quickcheck has already been performed then load session information and continue
+	//if fileExists(fmt.Sprintf("checkpoint_%d.json", current_step)) {
+	//jsonFile, err := os.Open(fmt.Sprintf("checkpoint_%d.json", current_step))
+	//byteValue, _ := ioutil.ReadAll(jsonFile)
+	//err = json.Unmarshal([]byte(byteValue), &barcode_list)
+	//if err != nil {
+	//panic(err)
+	//}
+
+	//log.Println(fmt.Sprintf("Checkpoint exists for step %d, loading progress", current_step))
+
+	//} else {
+	//log.Println("Indexing quickchecked bams")
+
+	//for i := range barcode_list {
+	//cram := &barcode_list[i]
+	//if cram.Realigned_quickcheck_success {
+	//wg.Add(1)
+	//indexBam(barcode_list, i, samtools_exec)
+	//}
+	//}
+	//wg.Wait() // wait until all quickcheck processes have finished
+
+	//writeCheckpoint(barcode_list, current_step)
+	//}
+
+	//current_step = 10
+	//// if counts matrix has already been built then load session info
+	//if fileExists(fmt.Sprintf("checkpoint_%d.json", current_step)) {
+	//jsonFile, err := os.Open(fmt.Sprintf("checkpoint_%d.json", current_step))
+	//byteValue, _ := ioutil.ReadAll(jsonFile)
+	//err = json.Unmarshal([]byte(byteValue), &barcode_list)
+	//if err != nil {
+	//panic(err)
+	//}
+
+	//log.Println(fmt.Sprintf("Checkpoint exists for step %d, loading progress", current_step))
+
+	//} else {
+	//log.Println("Running featurecounts on completed RNA bams")
+	//var rna_bams_featurecounts_input []string
+
+	//for i := range barcode_list {
+	//cram := &barcode_list[i]
+	//// if quickcheck worked then add its realigned and sorted bam path to list of bams to include in counts matrix
+	//if cram.Realigned_quickcheck_success {
+	//if stringInSlice(cram.Library_type, star_align_libraries) {
+	//rna_bams_featurecounts_input = append(rna_bams_featurecounts_input, cram.Realigned_bam_path)
+
+	//}
+	//}
+	//}
+
+	//if len(rna_bams_featurecounts_input) < 1 {
+	//log.Fatalln("Less than  1 bams in RNA category, not enough for featurecounts, aborting.")
+	//}
+
+	//err := os.Mkdir("E_Counts_matrix_RNA", 0755)
+	//if err != nil {
+	//log.Fatal(err)
+	//}
+
+	//matrix_out := "E_Counts_matrix_RNA/featurecounts_matrix.tsv"
+	//job_out := "E_Counts_matrix_RNA/featurecounts_run.o"
+	//job_err := "E_Counts_matrix_RNA/featurecounts_run.e"
+
+	//featureCountsCmd := []string{
+	//"-o", job_out,
+	//"-e", job_err,
+	//"-R'select[mem>20000] rusage[mem=20000]'", "-M20000",
+	//"-n", "14",
+	//featurecounts_exec,
+	//"-Q", "30",
+	//"-p",
+	//"-t", "exon",
+	//"-g", "gene_name",
+	//"-F", "GTF",
+	//"-a", genome_annot,
+	//"-o", matrix_out}
+
+	//// append bam paths to end of command options, as this is what featureCounts expects
+	//featureCountsCmd = append(featureCountsCmd, rna_bams_featurecounts_input...)
+
+	//output, err := exec.Command("bsub", featureCountsCmd...).CombinedOutput()
+
+	//if err != nil {
+	//// Display everything we got if error.
+	//log.Println("Error when running command.  Output:")
+	//log.Println(string(output))
+	//log.Printf("Got command status: %s\n", err.Error())
+	//return
+	//}
+
+	//// wait for featurecounts job to finish
+	//for {
+	//dat, err := ioutil.ReadFile(job_out)
+	//if err == nil {
+	//if strings.Contains(string(dat), "Terminated at") {
+	//break
+	//}
+	//}
+	//time.Sleep(5 * time.Second)
+	//}
+
+	//// if featurecounts exited successfuly write new checkpoint file
+	//// this doesn't have any new information but its presence will indicate not to repeat the featurecounts step
+	//dat, err := ioutil.ReadFile(job_out)
+	//if err == nil {
+	//if strings.Contains(string(dat), "Successfully completed.") {
+	//writeCheckpoint(barcode_list, current_step)
+	//}
+	//}
+	//}
 }
