@@ -158,8 +158,11 @@ type barcode struct {
 	Masterbam_MT_subset                      string
 	Masterbam_MT_subset_quickcheck_success   bool
 	Masterbam_MT_subset_index_success        bool
+	Masterbam_QC_subset                      string
+	Masterbam_QC_subset_quickcheck_success   bool
+	Masterbam_QC_subset_index_success        bool
 	Masterbam_UMI_deduped                    string
-	Masterbam_UMI_deduped_success            string
+	Masterbam_UMI_deduped_success            bool
 	Masterbam_UMI_deduped_quickcheck_success bool
 	Masterbam_UMI_deduped_index_success      bool
 	Splitbam_jobout                          string
@@ -226,12 +229,14 @@ func main() {
 	//genome_annot := viper.GetString("genome_annot")
 
 	var input string
+	var barcodes_qc string
 	var threads string
 	var current_step int
 
 	// flags declaration using flag package
 	flag.StringVar(&input, "i", "input", "input bam file produced by 10X CellRanger")
 	flag.StringVar(&output_dir, "o", "output", "path to output directory")
+	flag.StringVar(&barcodes_qc, "b", "barcodes", "list of QC passed barcodes")
 
 	flag.Parse() // after declaring flags we need to call it
 	if (strings.TrimSpace(input) == "input") || (strings.TrimSpace(output_dir) == "output_dir") {
@@ -380,6 +385,59 @@ func main() {
 	} else {
 		log.Println(fmt.Sprintf("Starting step %d", current_step))
 
+		log.Println("Subsetting to QC passed barcodes")
+		(&barcode_list[0]).Masterbam_QC_subset = output_dir + "/MT_subset_QC_filtered.bam"
+
+		output, err := exec.Command(
+			"bsub",
+			"-I",
+			"-R'select[mem>5000] rusage[mem=5000]'", "-M5000",
+			"-n", "12",
+			"subset-bam", "--cores", "12",
+			"--bam", (&barcode_list[0]).Masterbam_MT_subset,
+			"--cell-barcodes", barcodes_qc,
+			"--out-bam", (&barcode_list[0]).Masterbam_QC_subset).CombinedOutput()
+
+		if err != nil {
+			// Display everything we got if error.
+			log.Println("Error when running command.  Output:")
+			log.Println(string(output))
+			log.Printf("Got command status: %s\n", err.Error())
+			return
+		}
+
+		output, err = exec.Command(samtools_exec, "quickcheck", (&barcode_list[0]).Masterbam_QC_subset).CombinedOutput()
+
+		if err != nil {
+			// Display everything we got if error.
+			log.Println("Error when running command.  Output:")
+			log.Println(string(output))
+			log.Printf("Got command status: %s\n", err.Error())
+			(&barcode_list[0]).Masterbam_QC_subset_quickcheck_success = false
+		} else {
+			(&barcode_list[0]).Masterbam_QC_subset_quickcheck_success = true
+		}
+
+		indexBam((&barcode_list[0]).Masterbam_QC_subset)
+		(&barcode_list[0]).Masterbam_QC_subset_index_success = true
+
+		writeCheckpoint(barcode_list, current_step)
+	}
+
+	current_step = 5
+	if fileExists(output_dir + fmt.Sprintf("checkpoint_%d.json", current_step)) {
+		jsonFile, err := os.Open(output_dir + fmt.Sprintf("checkpoint_%d.json", current_step))
+		byteValue, _ := ioutil.ReadAll(jsonFile)
+		err = json.Unmarshal([]byte(byteValue), &barcode_list)
+		if err != nil {
+			panic(err)
+		}
+
+		log.Println(fmt.Sprintf("Checkpoint exists for step %d, loading progress", current_step))
+
+	} else {
+		log.Println(fmt.Sprintf("Starting step %d", current_step))
+
 		log.Println("Deduplicating UMIs")
 		deduped_bam := output_dir + "/MT_subset_umi_deduped.bam"
 		(&barcode_list[0]).Masterbam_UMI_deduped = deduped_bam
@@ -394,7 +452,7 @@ func main() {
 			"--extract-umi-method", "tag",
 			"--umi-tag", "UB",
 			"--per-cell", "--cell-tag", "CB",
-			"-I", (&barcode_list[0]).Masterbam_MT_subset,
+			"-I", (&barcode_list[0]).Masterbam_QC_subset,
 			"-S", (&barcode_list[0]).Masterbam_UMI_deduped).CombinedOutput()
 
 		if err != nil {
@@ -405,10 +463,25 @@ func main() {
 			return
 		}
 
+		(&barcode_list[0]).Masterbam_UMI_deduped_success = true
+
+		// quickcheck produced bam
+		output, err = exec.Command(samtools_exec, "quickcheck", (&barcode_list[0]).Masterbam_UMI_deduped).CombinedOutput()
+
+		if err != nil {
+			// Display everything we got if error.
+			log.Println("Error when running command.  Output:")
+			log.Println(string(output))
+			log.Printf("Got command status: %s\n", err.Error())
+			(&barcode_list[0]).Masterbam_UMI_deduped_quickcheck_success = false
+		} else {
+			(&barcode_list[0]).Masterbam_UMI_deduped_quickcheck_success = true
+		}
+
 		writeCheckpoint(barcode_list, current_step)
 	}
 
-	current_step = 5
+	current_step = 6
 	if fileExists(output_dir + fmt.Sprintf("checkpoint_%d.json", current_step)) {
 		jsonFile, err := os.Open(output_dir + fmt.Sprintf("checkpoint_%d.json", current_step))
 		byteValue, _ := ioutil.ReadAll(jsonFile)
@@ -430,7 +503,7 @@ func main() {
 		writeCheckpoint(barcode_list, current_step)
 	}
 
-	current_step = 6
+	current_step = 7
 	if fileExists(output_dir + fmt.Sprintf("checkpoint_%d.json", current_step)) {
 		jsonFile, err := os.Open(output_dir + fmt.Sprintf("checkpoint_%d.json", current_step))
 		byteValue, _ := ioutil.ReadAll(jsonFile)
