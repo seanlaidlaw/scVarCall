@@ -17,7 +17,6 @@ import (
 	"time"
 
 	"github.com/spf13/viper"
-	"github.com/zenthangplus/goccm"
 )
 
 // PIPELINE STEPS
@@ -182,6 +181,7 @@ type barcode struct {
 }
 
 var barcode_list []barcode
+var chunk_cell_map map[string]string
 
 var output_dir string
 var samtools_exec string
@@ -241,7 +241,7 @@ func main() {
 	output_dir = output_dir + "/"
 
 	mt_subset_bam := output_dir + "/MT_subset.bam"
-	threads = "64"
+	threads = "4"
 
 	current_step = 1
 	if fileExists(output_dir + fmt.Sprintf("checkpoint_%d.json", current_step)) {
@@ -504,117 +504,101 @@ func main() {
 		// chunk the list of barcodes into groups of 1000
 		chunked_barcode_list := chunkSlice(barcode_list[1:], 1000)
 
-		threads_int, _ := strconv.Atoi(threads)
-		c := goccm.New(threads_int)
-
 		for chunk_i, chunk := range chunked_barcode_list {
 
-			// This function have to call before any goroutine
-			c.Wait()
-			go func(chunk []barcode, chunk_i int) {
-				chunk_cell_map := make(map[string]string)
-				chunk_output := output_dir + "/chunk_" + strconv.Itoa(chunk_i) + "/"
-				_ = os.MkdirAll(chunk_output, 0755)
+			chunk_cell_map = make(map[string]string)
+			chunk_output := output_dir + "/chunk_" + strconv.Itoa(chunk_i) + "/"
+			err := os.Mkdir(chunk_output, 0755)
+			if err != nil {
+				log.Fatal(err)
+			}
 
-				for i := range chunk {
-					cell := &chunk[i]
+			for i := range chunk {
+				cell := &chunk[i]
 
-					cell.Splitbam_jobout = chunk_output + "cellsplit_" + cell.Name + ".o"
-					cell.Splitbam_joberr = chunk_output + "cellsplit_" + cell.Name + ".e"
-					cell.Splitbam_bamout = chunk_output + "cell_" + cell.Name + ".bam"
-					cell.Splitbam_bamindex = cell.Splitbam_bamout + ".bai"
-					cell.Splitbam_barcodefile = chunk_output + "barcode_" + cell.Name + ".txt"
+				cell.Splitbam_jobout = chunk_output + "cellsplit_" + cell.Name + ".o"
+				cell.Splitbam_joberr = chunk_output + "cellsplit_" + cell.Name + ".e"
+				cell.Splitbam_bamout = chunk_output + "cell_" + cell.Name + ".bam"
+				cell.Splitbam_bamindex = cell.Splitbam_bamout + ".bai"
+				cell.Splitbam_barcodefile = chunk_output + "barcode_" + cell.Name + ".txt"
 
-					// write a file with barcode inside for splitbam
-					job_barcode_out, err := os.Create(cell.Splitbam_barcodefile)
-					if err != nil {
-						log.Fatal(err)
-					}
-					defer job_barcode_out.Close()
-					_, err = job_barcode_out.WriteString(cell.Name + "\n")
+				// write a file with barcode inside for splitbam
+				job_barcode_out, err := os.Create(cell.Splitbam_barcodefile)
+				if err != nil {
+					log.Fatal(err)
+				}
+				defer job_barcode_out.Close()
+				_, err = job_barcode_out.WriteString(cell.Name + "\n")
 
-					// add this barcode to list of current jobs
-					chunk_cell_map[cell.Name] = cell.Splitbam_jobout
+				// add this barcode to list of current jobs
+				chunk_cell_map[cell.Name] = cell.Splitbam_jobout
 
-					// split bam to current barcode
-					output, err := exec.Command(
-						"bsub",
-						"-o", cell.Splitbam_jobout,
-						"-e", cell.Splitbam_joberr,
-						"-R'select[mem>5000] rusage[mem=5000]'", "-M5000",
-						"-n", "12",
-						"subset-bam", "--cores", "12",
-						"--bam", (&barcode_list[0]).Masterbam_UMI_deduped,
-						"--cell-barcodes", cell.Splitbam_barcodefile,
-						"--out-bam", cell.Splitbam_bamout).CombinedOutput()
+				// split bam to current barcode
+				output, err := exec.Command(
+					"bsub",
+					"-o", cell.Splitbam_jobout,
+					"-e", cell.Splitbam_joberr,
+					"-R'select[mem>5000] rusage[mem=5000]'", "-M5000",
+					"-n", "12",
+					"subset-bam", "--cores", "12",
+					"--bam", (&barcode_list[0]).Masterbam_UMI_deduped,
+					"--cell-barcodes", cell.Splitbam_barcodefile,
+					"--out-bam", cell.Splitbam_bamout).CombinedOutput()
 
-					if err != nil {
-						// Display everything we got if error.
-						log.Println("Error when running command.  Output:")
-						log.Println(string(output))
-						log.Printf("Got command status: %s\n", err.Error())
-						return
-					}
+				if err != nil {
+					// Display everything we got if error.
+					log.Println("Error when running command.  Output:")
+					log.Println(string(output))
+					log.Printf("Got command status: %s\n", err.Error())
+					return
+				}
+			}
+
+			// wait for that chunks splits to finish
+			bjobsIsCompleted(chunk_cell_map, "Splitbam_successful", &barcode_list, []string{"Splitbam_jobout", "Splitbam_joberr", "Splitbam_barcodefile"})
+
+			// index the split bam files
+			for i := range chunk {
+				cell := &chunk[i]
+				indexBam(cell.Splitbam_bamout)
+				cell.Splitbam_indexed = true
+			}
+
+			// run variant calling on the bam files
+			for i := range chunk {
+				cell := &chunk[i]
+
+				cell.Rvarcall_jobout = chunk_output + "cellsplit_" + cell.Name + ".o"
+				cell.Rvarcall_joberr = chunk_output + "cellsplit_" + cell.Name + ".e"
+				cell.Rvarcall_out = chunk_output
+
+				// add this barcode to list of current jobs
+				chunk_cell_map[cell.Name] = cell.Rvarcall_jobout
+
+				// split bam to current barcode
+				output, err := exec.Command(
+					"bsub",
+					"-o", cell.Rvarcall_jobout,
+					"-e", cell.Rvarcall_joberr,
+					"-R'select[mem>5000] rusage[mem=5000]'", "-M5000",
+					"-n", "1",
+					Rscript_exec, "callVars.R",
+					cell.Splitbam_bamout,
+					cell.Rvarcall_out).CombinedOutput()
+
+				if err != nil {
+					// Display everything we got if error.
+					log.Println("Error when running command.  Output:")
+					log.Println(string(output))
+					log.Printf("Got command status: %s\n", err.Error())
+					return
 				}
 
-				// wait for that chunks splits to finish
-				bjobsIsCompleted(
-					chunk_cell_map,
-					"Splitbam_successful",
-					&barcode_list,
-					[]string{"Splitbam_jobout", "Splitbam_joberr", "Splitbam_barcodefile"},
-				)
-
-				// index the split bam files
-				for i := range chunk {
-					cell := &chunk[i]
-					indexBam(cell.Splitbam_bamout)
-					cell.Splitbam_indexed = true
-				}
-
-				// run variant calling on the bam files
-				for i := range chunk {
-					cell := &chunk[i]
-
-					cell.Rvarcall_jobout = chunk_output + "cellsplit_" + cell.Name + ".o"
-					cell.Rvarcall_joberr = chunk_output + "cellsplit_" + cell.Name + ".e"
-					cell.Rvarcall_out = chunk_output
-
-					// add this barcode to list of current jobs
-					chunk_cell_map[cell.Name] = cell.Rvarcall_jobout
-
-					// split bam to current barcode
-					output, err := exec.Command(
-						"bsub",
-						"-o", cell.Rvarcall_jobout,
-						"-e", cell.Rvarcall_joberr,
-						"-R'select[mem>5000] rusage[mem=5000]'", "-M5000",
-						"-n", "1",
-						Rscript_exec, "callVars.R",
-						cell.Splitbam_bamout,
-						cell.Rvarcall_out).CombinedOutput()
-
-					if err != nil {
-						// Display everything we got if error.
-						log.Println("Error when running command.  Output:")
-						log.Println(string(output))
-						log.Printf("Got command status: %s\n", err.Error())
-						return
-					}
-
-				}
-				// wait for variant calls to finish
-				bjobsIsCompleted(
-					chunk_cell_map,
-					"Rvarcall_command_successful",
-					&barcode_list,
-					[]string{"Rvarcall_jobout", "Rvarcall_joberr", "Splitbam_bamout", "Splitbam_bamindex"},
-				)
-				c.Done()
-			}(chunk, chunk_i)
+			}
+			// wait for variant calls to finish
+			bjobsIsCompleted(chunk_cell_map, "Rvarcall_command_successful", &barcode_list, []string{"Rvarcall_jobout", "Rvarcall_joberr", "Splitbam_bamout", "Splitbam_bamindex"})
 
 		}
-		c.WaitAllDone()
 		writeCheckpoint(barcode_list, current_step)
 
 	}
