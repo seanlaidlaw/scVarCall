@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"reflect"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -567,8 +568,15 @@ func main() {
 
 		barcodefile_scanner := bufio.NewScanner(gr)
 		for barcodefile_scanner.Scan() {
-			// remove CB:Z: prefix to get just the cell barcode
-			barcode_str := strings.Trim(barcodefile_scanner.Text(), "CB:Z:")
+			// remove 'CB:Z:' prefix to get just the cell barcode
+			leading_regex := regexp.MustCompile(`^CB:Z:`)
+			barcode_str := leading_regex.ReplaceAllString(barcodefile_scanner.Text(), "")
+
+			if len(barcode_str) != 18 {
+				log.Println("Problem with barcode parsed from: " + barcodefile_scanner.Text())
+				log.Fatalln(fmt.Sprintf("Barcode '%s' is not of expected length, should be 18bp (with -1 ending) but is %d", barcode_str, len(barcode_str)))
+			}
+
 			new_barcode := barcode{Name: barcode_str}
 
 			barcode_list = append(barcode_list, new_barcode)
