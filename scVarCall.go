@@ -33,6 +33,12 @@ import (
 // 0. Index bam file
 // 0. Call all variants (not just second-max)
 
+func rmIfExists(file_path string) {
+	if fileExists(file_path) {
+		os.Remove(file_path)
+	}
+}
+
 func chunkSlice(slice []barcode, chunkSize int) [][]barcode {
 	var chunks [][]barcode
 	for i := 0; i < len(slice); i += chunkSize {
@@ -175,10 +181,10 @@ type barcode struct {
 	Splitbam_indexed                         bool
 	Rvarcall_jobout                          string
 	Rvarcall_joberr                          string
-	Rvarcall_out                             string
+	Rvarcall_dir_out                         string
+	Rvarcall_call_out                        string
+	Rvarcall_cov_out                         string
 	Rvarcall_command_successful              bool
-	Rdsmerge_out                             string
-	Rdsmerge_err                             string
 	Rdsmerge_rds_calls                       string
 	Rdsmerge_rds_coverage                    string
 	Rdsmerge_success                         bool
@@ -539,7 +545,7 @@ func main() {
 		writeCheckpoint(barcode_list, current_step)
 	}
 
-	current_step = 7
+	current_step = 8
 	if fileExists(output_dir + fmt.Sprintf("checkpoint_%d.json", current_step)) {
 		jsonFile, err := os.Open(output_dir + fmt.Sprintf("checkpoint_%d.json", current_step))
 		byteValue, _ := ioutil.ReadAll(jsonFile)
@@ -582,9 +588,10 @@ func main() {
 			barcode_list = append(barcode_list, new_barcode)
 		}
 
-		// chunk the list of barcodes into groups of 1000
-		chunked_barcode_list := chunkSlice(barcode_list[1:], 1000)
+		// chunk the list of barcodes into groups of 500
+		chunked_barcode_list := chunkSlice(barcode_list[1:], 500)
 
+		log.Println("Spliting and calling variants on chunks of 500 barcodes")
 		for chunk_i, chunk := range chunked_barcode_list {
 
 			chunk_cell_map = make(map[string]string)
@@ -641,44 +648,89 @@ func main() {
 			// index the split bam files
 			for i := range chunk {
 				cell := &chunk[i]
-				indexBam(cell.Splitbam_bamout)
-				cell.Splitbam_indexed = true
+				if cell.Splitbam_successful {
+					indexBam(cell.Splitbam_bamout)
+					cell.Splitbam_indexed = true
+				}
 			}
 
 			// run variant calling on the bam files
 			for i := range chunk {
 				cell := &chunk[i]
+				if cell.Splitbam_indexed {
 
-				cell.Rvarcall_jobout = chunk_output + "cellsplit_" + cell.Name + ".o"
-				cell.Rvarcall_joberr = chunk_output + "cellsplit_" + cell.Name + ".e"
-				cell.Rvarcall_out = chunk_output
+					cell.Rvarcall_jobout = chunk_output + "Rvarcall_" + cell.Name + ".o"
+					cell.Rvarcall_joberr = chunk_output + "Rvarcall_" + cell.Name + ".e"
+					cell.Rvarcall_dir_out = chunk_output
 
-				// add this barcode to list of current jobs
-				chunk_cell_map[cell.Name] = cell.Rvarcall_jobout
+					// add this barcode to list of current jobs
+					chunk_cell_map[cell.Name] = cell.Rvarcall_jobout
 
-				// split bam to current barcode
-				output, err := exec.Command(
-					"bsub",
-					"-o", cell.Rvarcall_jobout,
-					"-e", cell.Rvarcall_joberr,
-					"-R'select[mem>5000] rusage[mem=5000]'", "-M5000",
-					"-n", "1",
-					Rscript_exec, "callVars.R",
-					cell.Splitbam_bamout,
-					cell.Rvarcall_out).CombinedOutput()
+					// call variants on bam
+					output, err := exec.Command(
+						"bsub",
+						"-o", cell.Rvarcall_jobout,
+						"-e", cell.Rvarcall_joberr,
+						"-R'select[mem>5000] rusage[mem=5000]'", "-M5000",
+						"-n", "1",
+						Rscript_exec, "callVars.R",
+						cell.Splitbam_bamout,
+						cell.Rvarcall_dir_out).CombinedOutput()
 
-				if err != nil {
-					// Display everything we got if error.
-					log.Println("Error when running command.  Output:")
-					log.Println(string(output))
-					log.Printf("Got command status: %s\n", err.Error())
-					return
+					if err != nil {
+						// Display everything we got if error.
+						log.Println("Error when running command.  Output:")
+						log.Println(string(output))
+						log.Printf("Got command status: %s\n", err.Error())
+						return
+					}
+
+					// set expected output merged rds filenames to barcode object
+					barcode_trimmed := strings.ReplaceAll(cell.Name, "-1", "")
+					cell.Rvarcall_call_out = cell.Rvarcall_dir_out + "cell_" + barcode_trimmed + ".calls.rds"
+					cell.Rvarcall_cov_out = cell.Rvarcall_dir_out + "cell_" + barcode_trimmed + ".coverage.rds"
+
 				}
-
 			}
+
 			// wait for variant calls to finish
 			bjobsIsCompleted(chunk_cell_map, "Rvarcall_command_successful", &barcode_list, []string{"Rvarcall_jobout", "Rvarcall_joberr", "Splitbam_bamout", "Splitbam_bamindex"})
 
+			// merge completed rds together into one rds for whole chunk
+			output, err := exec.Command(
+				"bsub",
+				"-I",
+				"-R'select[mem>16000] rusage[mem=16000]'", "-M16000",
+				Rscript_exec, "mergeVarcallRds.R",
+				chunk_output, strconv.Itoa(chunk_i)).CombinedOutput()
+
+			if err != nil {
+				// Display everything we got if error.
+				log.Println("Error when running command.  Output:")
+				log.Println(string(output))
+				log.Printf("Got command status: %s\n", err.Error())
+				return
+			}
+
+			for i := range chunk {
+				cell := &chunk[i]
+				if cell.Rvarcall_command_successful {
+
+					cell.Rdsmerge_rds_coverage = chunk_output + "chunk_" + strconv.Itoa(chunk_i) + ".coverage.rds"
+					cell.Rdsmerge_rds_calls = chunk_output + "chunk_" + strconv.Itoa(chunk_i) + ".calls.rds"
+
+					cell.Rdsmerge_success = true
+
+					if fileExists(cell.Rdsmerge_rds_coverage) {
+						rmIfExists(cell.Rvarcall_cov_out)
+					}
+
+					if fileExists(cell.Rdsmerge_rds_calls) {
+						rmIfExists(cell.Rvarcall_call_out)
+					}
+				}
+
+			}
 		}
 		writeCheckpoint(barcode_list, current_step)
 
